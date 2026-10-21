@@ -69,6 +69,19 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 	private readonly List<(float DistanceSquared, FloraStorage.ChunkCoord Coord)> _buildQueue = [];
 
 	/// <summary>
+	/// Scene objects a released chunk gave up, waiting to be handed to the next one built.
+	///
+	/// Making them is quick; destroying thousands at once is not, and that is the stall when you walk
+	/// out of a forest rather than into one. A pooled object is hidden rather than deleted, and comes
+	/// back with a new model and transform - the model setter does nothing at all when it is the same
+	/// species, which it usually is.
+	/// </summary>
+	private readonly List<SceneObject> _pool = [];
+
+	/// <summary>Most spare objects destroyed in one frame, so trimming never becomes the stall.</summary>
+	private const int TrimPerFrame = 256;
+
+	/// <summary>
 	/// Set when the frame budget ran out with chunks still to build, so streaming keeps running next
 	/// frame rather than waiting for the viewer to move far enough to be asked again.
 	/// </summary>
@@ -116,6 +129,16 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 		ReleaseAllChunks();
 		ReleaseCollision();
 
+		// Nothing left to hand them to. One bulk delete when the component goes is a cost worth
+		// paying; the pool exists to keep it out of ordinary streaming, not to outlive it.
+		foreach (var sceneObject in _pool)
+		{
+			if (sceneObject.IsValid())
+				sceneObject.Delete();
+		}
+
+		_pool.Clear();
+
 		_builtRevision = -1;
 		_hasStreamOrigin = false;
 	}
@@ -128,6 +151,10 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 
 		UpdateStreaming(viewer.Value);
 		UpdateCollision(viewer.Value);
+
+		// Outside UpdateStreaming on purpose - that returns early while the viewer is still, and a
+		// pool left holding a forest's worth of hidden objects is the memory this is meant to bound.
+		TrimPool();
 	}
 
 	/// <summary>
@@ -372,7 +399,7 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 			if (entry is null)
 				continue;
 
-			var sceneObject = new SceneObject(world, entry.Model, instance.ToTransform());
+			var sceneObject = Rent(world, entry.Model, instance.ToTransform());
 			sceneObject.Flags.CastShadows = chunk.ShadowsEnabled && entry.CastShadows;
 
 			chunk.Instances.Add(instance);
@@ -388,10 +415,7 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 			return;
 
 		foreach (var sceneObject in chunk.SceneObjects)
-		{
-			if (sceneObject.IsValid())
-				sceneObject.Delete();
-		}
+			Return(sceneObject);
 
 		chunk.SceneObjects.Clear();
 		chunk.Instances.Clear();
@@ -402,15 +426,65 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 		ReleaseChunkColliders(coord);
 	}
 
+	/// <summary>
+	/// A spare scene object set to this model and transform, or a new one when there are none. Taken
+	/// from the back, so the ones handed out are the ones most recently given up - those are the most
+	/// likely to still be the same species, and the model setter then does nothing.
+	/// </summary>
+	private SceneObject Rent(SceneWorld world, Model model, Transform transform)
+	{
+		while (_pool.Count > 0)
+		{
+			var pooled = _pool[^1];
+			_pool.RemoveAt(_pool.Count - 1);
+
+			if (!pooled.IsValid())
+				continue;
+
+			pooled.Model = model;
+			pooled.Transform = transform;
+			pooled.RenderingEnabled = true;
+
+			return pooled;
+		}
+
+		return new SceneObject(world, model, transform);
+	}
+
+	private void Return(SceneObject sceneObject)
+	{
+		if (!sceneObject.IsValid())
+			return;
+
+		sceneObject.RenderingEnabled = false;
+		_pool.Add(sceneObject);
+	}
+
+	/// <summary>
+	/// Lets the pool back down when it is holding far more than the forest is using - walking away
+	/// from a dense area hands back everything at once. A few at a time, because deleting them in
+	/// bulk is exactly the stall the pool exists to avoid.
+	/// </summary>
+	private void TrimPool()
+	{
+		var keep = Math.Max(LiveInstanceCount, 1024);
+
+		for (var i = 0; i < TrimPerFrame && _pool.Count > keep; i++)
+		{
+			var spare = _pool[^1];
+			_pool.RemoveAt(_pool.Count - 1);
+
+			if (spare.IsValid())
+				spare.Delete();
+		}
+	}
+
 	private void ReleaseAllChunks()
 	{
 		foreach (var (_, chunk) in _live)
 		{
 			foreach (var sceneObject in chunk.SceneObjects)
-			{
-				if (sceneObject.IsValid())
-					sceneObject.Delete();
-			}
+				Return(sceneObject);
 		}
 
 		_live.Clear();
