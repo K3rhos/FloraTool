@@ -9,6 +9,14 @@ FEATURES
 	#include "common/features.hlsl"
 
 	Feature( F_ALPHA_TEST, 0..1, "Rendering" );
+
+	Feature( F_WIND, 0..1, "Wind" );
+
+	// Whether the model carries the usual foliage weights in its vertex colour: red how much an edge
+	// flutters, green how much a branch sways, blue a phase to put it out of step with its
+	// neighbours. Models without them get those from the vertex's height instead, which keeps a trunk
+	// still at its base rather than wobbling it like a leaf.
+	Feature( F_WIND_VERTEX_WEIGHTS, 0..1, "Wind" );
 }
 
 MODES
@@ -26,6 +34,10 @@ COMMON
 struct VertexInput
 {
 	#include "common/vertexinput.hlsl"
+
+	// Not part of the standard input - declared here the way the engine's own foliage shader does.
+	// Where a model carries them, the wind weights live in it.
+	float4 vColor : COLOR0 < Semantic( Color ); >;
 };
 
 struct PixelInput
@@ -36,12 +48,121 @@ struct PixelInput
 VS
 {
 	#include "common/vertex.hlsl"
+	#include "common/trunk_bending.hlsl"
 
-	// Nothing custom here on purpose. ProcessVertex feeds the standard instancing path, which is
-	// what lets the engine batch every flora scene object sharing this material into one draw.
+	StaticCombo( S_WIND, F_WIND, Sys( ALL ) );
+	StaticCombo( S_WIND_VERTEX_WEIGHTS, F_WIND_VERTEX_WEIGHTS, Sys( ALL ) );
+
+#if S_WIND
+
+	// Bending goes with the square of height times this, and the constant inside ApplyTrunkBending is
+	// sized for metres rather than inches - so for a tree a thousand units tall anything near 1 moves
+	// it by a fraction of a unit, which reads as nothing at all. Tall trees want this well up.
+	float g_flSwayStrength < Default( 10.0 ); Range( 0.0, 25.0 ); UiGroup( "Wind,10/Trunk" ); >;
+	float g_flSwaySpeed < Default( 1.0 ); Range( 0.0, 10.0 ); UiGroup( "Wind,10/Trunk" ); >;
+
+	float g_flEdgeFrequency < Default( 1.0 ); Range( 0.1, 5.0 ); UiGroup( "Wind,20/Detail" ); >;
+	float g_flEdgeAmplitude < Default( 0.1 ); Range( 0.0, 1.0 ); UiGroup( "Wind,20/Detail" ); >;
+	float g_flBranchFrequency < Default( 0.5 ); Range( 0.1, 5.0 ); UiGroup( "Wind,20/Detail" ); >;
+	float g_flBranchAmplitude < Default( 0.1 ); Range( 0.0, 1.0 ); UiGroup( "Wind,20/Detail" ); >;
+
+	// The material's own wind, which the scene's is added to rather than replaced by. Added, because a
+	// scene that sets a very small wind would otherwise count as having one and leave the material's
+	// unused - nothing visibly moving, and no way to tell why from looking at it.
+	float g_flWindStrength < Default( 5.0 ); Range( 0.0, 25.0 ); UiGroup( "Wind,30/Strength" ); >;
+	float2 g_vWindDirection2D < Default2( 1.0, 0.0 ); UiGroup( "Wind,30/Strength" ); >;
+
+	/// Multiplies both together, for turning the whole thing up or down in one place.
+	float g_flWindScale < Default( 1.0 ); Range( 0.0, 4.0 ); UiGroup( "Wind,30/Strength" ); >;
+
+	#if !S_WIND_VERTEX_WEIGHTS
+		// How far up the model counts as fully exposed, for a model with no wind weights painted in.
+		float g_flWindFullHeight < Default( 256.0 ); Range( 16.0, 4096.0 ); UiGroup( "Wind,30/Strength" ); >;
+	#endif
+
+	float4 SmoothCurve( float4 x ) { return x * x * ( 3.0 - 2.0 * x ); }
+	float4 TriangleWave( float4 x ) { return abs( frac( x + 0.5 ) * 2.0 - 1.0 ); }
+	float4 SmoothTriangleWave( float4 x ) { return SmoothCurve( TriangleWave( x ) ); }
+
+	// High-frequency bending, after GPU Gems 3 chapter 16 and the engine's own foliage shader: edges
+	// flutter along their normal, branches sway up and along the wind, each on its own phase.
+	void FloraDetailBending( inout float3 vPositionOs, float3 vNormalOs, float3 vWeights, float3x4 matObjectToWorld, float3 vWind )
+	{
+		const float4 vFoliageFreqs = float4( 1.975, 0.793, 0.375, 0.193 );
+
+		const float flEdgeAtten = vWeights.r;
+		const float flBranchAtten = vWeights.g;
+		const float flDetailPhase = vWeights.b;
+
+		// Taken from where the tree stands, so no two of them move together. Without it a forest
+		// sways as one sheet, which is the thing that gives procedural wind away.
+		float flObjPhase = dot( mul( matObjectToWorld, float4( 0, 0, 0, 1 ) ), 1 );
+		float flBranchPhase = flDetailPhase + flObjPhase;
+		float flVtxPhase = dot( vPositionOs.xyz, flDetailPhase + flBranchPhase );
+
+		const float maxPhase = 50000.0f;
+
+		float2 vTime = g_flTime * float2( g_flEdgeFrequency, g_flBranchFrequency );
+		float2 vPhaseOffset = fmod( float2( flVtxPhase, flBranchPhase ), maxPhase );
+		float2 vWavesIn = vTime + vPhaseOffset;
+
+		float4 vWaves = frac( vWavesIn.xxyy * vFoliageFreqs ) * 2.0 - 1.0;
+		vWaves = SmoothTriangleWave( vWaves );
+		float2 vWavesSum = vWaves.xz + vWaves.yw;
+
+		float flWindIntensity = saturate( length( vWind ) * 0.2 );
+
+		// A branch across the wind is pushed more than one pointing along it.
+		float flBranchWindBend = 1.0f - abs( dot( normalize( vWind.xyz + 0.001 ), normalize( float3( vPositionOs.xy, 0.0f ) + 0.001 ) ) );
+		flBranchWindBend *= flBranchWindBend;
+
+		vPositionOs.xyz += vWavesSum.x * flEdgeAtten * g_flEdgeAmplitude * flWindIntensity * vNormalOs.xyz;
+		vPositionOs.xyz += vWavesSum.y * flBranchAtten * g_flBranchAmplitude * flWindIntensity * float3( 0.0f, 0.0f, 1.0f );
+		vPositionOs.xyz += vWavesSum.y * flBranchAtten * g_flBranchAmplitude * flBranchWindBend * flWindIntensity * vWind.xyz;
+	}
+
+#endif
+
 	PixelInput MainVs( VertexInput v )
 	{
-		return FinalizeVertex( ProcessVertex( v ) );
+		PixelInput o = ProcessVertex( v );
+
+#if S_WIND
+		float3 vNormalOs;
+		float4 vTangentUOs_flTangentVSign;
+
+		VS_DecodeObjectSpaceNormalAndTangent( v, vNormalOs, vTangentUOs_flTangentVSign );
+
+		float3 vPositionOs = v.vPositionOs.xyz;
+		float3x4 matObjectToWorld = GetTransformMatrix( v.nInstanceTransformID );
+
+		// The scene's wind, or the material's own when the scene sets none - the engine leaves these
+		// at zero in a scene with nothing driving them, and then nothing but the trunk would move.
+		float3 vSceneWind = g_vWindDirection.xyz * g_vWindStrengthFreqMulHighStrength.x;
+
+		// The detail bending reads intensity as saturate( length * 0.2 ), so a unit vector only reaches
+		// a fifth of its range - which is why the material's strength is in whole units rather than
+		// fractions, and why 5 is where it starts to look like weather.
+		float3 vOwnWind = float3( normalize( g_vWindDirection2D.xy + 0.0001f ), 0.0f ) * g_flWindStrength;
+		float3 vWind = ( vSceneWind + vOwnWind ) * g_flWindScale;
+
+		#if S_WIND_VERTEX_WEIGHTS
+			float3 vWeights = v.vColor.rgb;
+		#else
+			// No weights painted in, so height stands in for them: nothing at the base, everything at
+			// the crown. The phase varies down the trunk so one tree does not move all of a piece.
+			float flUp = saturate( vPositionOs.z / g_flWindFullHeight );
+			float3 vWeights = float3( flUp * flUp, flUp, frac( vPositionOs.z * 0.01f ) );
+		#endif
+
+		ApplyTrunkBending( vPositionOs, g_flSwayStrength, g_flSwaySpeed, vWind, g_flTime );
+		FloraDetailBending( vPositionOs, vNormalOs, vWeights, matObjectToWorld, vWind );
+
+		o.vPositionWs = mul( matObjectToWorld, float4( vPositionOs.xyz, 1.0 ) );
+		o.vPositionPs.xyzw = Position3WsToPs( o.vPositionWs.xyz );
+#endif
+
+		return FinalizeVertex( o );
 	}
 }
 
