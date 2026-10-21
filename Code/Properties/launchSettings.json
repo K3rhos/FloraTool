@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "Editor": {
+      "commandName": "Executable",
+      "executablePath": "E:/SteamLibrary/steamapps/common/sbox/sbox-dev.exe",
+      "commandLineArgs": "-project \u0022C:\\Users\\K3rhos\\Documents\\s\u0026box projects\\mytestbed2\\Libraries\\FloraTool\\floratool.sbproj\u0022"
+    }
+  }
+}
