@@ -92,6 +92,16 @@ public sealed class FloraDefinition : GameResource
 	public float ShadowDistance { get; set; } = 10000.0f;
 
 	/// <summary>
+	/// Milliseconds a frame may spend building newly streamed chunks, nearest first.
+	///
+	/// A chunk is thousands of scene objects, and crossing into a dense area wants several of them at
+	/// once. Built in one go that is a visible stall; spread over a few frames it is flora arriving a
+	/// moment late, which is much harder to notice.
+	/// </summary>
+	[Property, Group("Streaming"), Range(0.5f, 8.0f)]
+	public float BuildBudget { get; set; } = 2.0f;
+
+	/// <summary>
 	/// Radius around the viewer within which entries flagged <see cref="FloraEntry.EnablePhysics"/>
 	/// get real colliders. Keep it just past where the player can reach.
 	/// </summary>

@@ -59,8 +59,27 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 	public FloraStorage Storage { get; set; } = new();
 
 	private readonly Dictionary<FloraStorage.ChunkCoord, LiveChunk> _live = [];
-	private readonly List<FloraStorage.ChunkCoord> _wantedChunks = [];
+
+	// A set, not a list: SyncChunks asks it about every live chunk, and a linear scan inside that loop
+	// is quadratic in the number of chunks streamed in.
+	private readonly HashSet<FloraStorage.ChunkCoord> _wantedChunks = [];
 	private readonly List<FloraStorage.ChunkCoord> _staleChunks = [];
+
+	/// <summary>What is wanted but not yet standing, nearest first.</summary>
+	private readonly List<(float DistanceSquared, FloraStorage.ChunkCoord Coord)> _buildQueue = [];
+
+	/// <summary>
+	/// Set when the frame budget ran out with chunks still to build, so streaming keeps running next
+	/// frame rather than waiting for the viewer to move far enough to be asked again.
+	/// </summary>
+	private bool _streamIncomplete;
+
+	/// <summary>
+	/// How much further out a chunk is released than it is built. A chunk sitting exactly on the line
+	/// would otherwise be destroyed and rebuilt as the camera jitters across it, and rebuilding one
+	/// means recreating every scene object in it.
+	/// </summary>
+	private const float StreamHysteresis = 1.15f;
 
 	// Reused across chunk builds so streaming doesn't allocate a fresh list per chunk.
 	private readonly List<FloraGenerator.Instance> _scratchInstances = [];
@@ -140,7 +159,7 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 		// the stream radius - tens of thousands of them, every frame of the drag.
 		var dirty = _builtRevision != Storage.Revision;
 
-		if (!dirty && _hasStreamOrigin && origin.Distance(_lastStreamOrigin) < StreamRefreshDistance)
+		if (!dirty && !_streamIncomplete && _hasStreamOrigin && origin.Distance(_lastStreamOrigin) < StreamRefreshDistance)
 			return;
 
 		if (dirty)
@@ -172,23 +191,67 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 	private void GatherWantedChunks(Vector3 origin)
 	{
 		_wantedChunks.Clear();
+		_buildQueue.Clear();
 
 		// A chunk's near corner can be in range while its centre is not, hence the circumradius.
-		var radius = Definition.StreamRadius + FloraStorage.ChunkSize * 0.7072f;
-		var radiusSquared = radius * radius;
+		var build = Definition.StreamRadius + FloraStorage.ChunkSize * 0.7072f;
+		var buildSquared = build * build;
 
-		foreach (var (coord, _) in Storage.Chunks)
+		var keep = build * StreamHysteresis;
+		var keepSquared = keep * keep;
+
+		void Consider(FloraStorage.ChunkCoord coord)
 		{
 			var center = FloraStorage.ChunkCenter(coord);
 
 			var dx = center.x - origin.x;
 			var dy = center.y - origin.y;
+			var distanceSquared = dx * dx + dy * dy;
 
-			if (dx * dx + dy * dy > radiusSquared)
-				continue;
+			if (distanceSquared > keepSquared)
+				return;
+
+			var live = _live.ContainsKey(coord);
+
+			// Only what is already standing gets the further radius; nothing new starts out there.
+			if (!live && distanceSquared > buildSquared)
+				return;
 
 			_wantedChunks.Add(coord);
+
+			if (!live)
+				_buildQueue.Add((distanceSquared, coord));
 		}
+
+		// Walking every painted chunk costs the whole map however little of it is in range, and
+		// walking the square around the viewer costs the same however little of it is painted. Take
+		// whichever is the smaller of the two.
+		var span = (int)MathF.Ceiling(keep / FloraStorage.ChunkSize) + 1;
+		var across = 2 * span + 1;
+
+		if (across * across < Storage.Chunks.Count)
+		{
+			var middle = FloraStorage.WorldToChunk(origin);
+
+			for (var y = -span; y <= span; y++)
+			{
+				for (var x = -span; x <= span; x++)
+				{
+					var coord = new FloraStorage.ChunkCoord(middle.X + x, middle.Y + y);
+
+					if (Storage.Chunks.ContainsKey(coord))
+						Consider(coord);
+				}
+			}
+		}
+		else
+		{
+			foreach (var (coord, _) in Storage.Chunks)
+				Consider(coord);
+		}
+
+		// Nearest first, so a frame that runs out of time has spent it on what is closest.
+		_buildQueue.Sort(static (first, second) => first.DistanceSquared.CompareTo(second.DistanceSquared));
 	}
 
 	private void SyncChunks(Vector3 origin)
@@ -204,12 +267,28 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 		foreach (var coord in _staleChunks)
 			ReleaseChunk(coord);
 
-		foreach (var coord in _wantedChunks)
+		// Built nearest first, and only for as long as the budget allows. Streaming into a dense
+		// forest otherwise builds every newly wanted chunk in one frame - thousands of scene objects
+		// at once, and a visible stall every time the viewer crosses a chunk.
+		var started = RealTime.NowDouble;
+		var budget = Definition.BuildBudget;
+
+		_streamIncomplete = false;
+
+		foreach (var (_, coord) in _buildQueue)
 		{
 			if (_live.ContainsKey(coord))
 				continue;
 
 			BuildChunk(coord, origin);
+
+			if ((RealTime.NowDouble - started) * 1000.0 <= budget)
+				continue;
+
+			// What is left stays wanted, so nothing releases it; the flag is what brings streaming
+			// back next frame, since the viewer may not have moved far enough to ask again.
+			_streamIncomplete = true;
+			break;
 		}
 
 		UpdateChunkShadows(origin);
@@ -337,6 +416,11 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 		_live.Clear();
 		_wantedChunks.Clear();
 		_staleChunks.Clear();
+
+		// The queue named chunks that no longer exist, and a half-finished pass over it means nothing
+		// once everything has gone.
+		_buildQueue.Clear();
+		_streamIncomplete = false;
 	}
 
 	/// <summary>
