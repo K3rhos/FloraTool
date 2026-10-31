@@ -213,6 +213,19 @@ PS
 
 	float g_flAmbientScale < UiGroup( "Foliage,4/,0/0" ); Default1( 1.0 ); Range1( 0, 2 ); >;
 
+	// How much of the snow settled on the flora this material takes: 1 all of it, 0 none - a plant kept indoors, say.
+	float g_flSnowHold < UiGroup( "Snow,5/,0/0" ); Default1( 1.0 ); Range1( 0, 1 ); >;
+
+	// Snow settled on the flora, for a game with weather to set through the scene's render attributes: how far it has built
+	// up, 0 to 1, and its colour. Nothing sets it by default, so flora looks as it always has wherever a game doesn't.
+	float g_flFloraSnowCover < Attribute( "FloraSnowCover" ); Default( 0.0 ); >;
+	float3 g_vFloraSnowColor < Attribute( "FloraSnowColor" ); Default3( 0.92, 0.95, 1.0 ); >;
+
+	// How far down the sides the snow reaches once it has fully built up, as the upward share of a facing it still holds on
+	// at: a quarter, about 75 degrees from flat. And how soft its edge is, in as much facing again.
+	#define FLORA_SNOW_STEEPEST 0.25f
+	#define FLORA_SNOW_SOFTNESS 0.3f
+
 	// Cascade shadows without the screen-space contact shadow mask that
 	// DirectionalLightShadow::GetVisibility folds in. Flora does take part in the depth prepass, so
 	// that mask is valid here - but it costs a texture fetch per pixel per light for an effect that
@@ -296,6 +309,18 @@ PS
 		#if ( S_RENDER_BACKFACES )
 			normalWs = i.face ? normalWs : -normalWs;
 		#endif
+
+		// Snow settled on it, wherever it faces up: the flattest first, then further down its sides as more builds up. By its
+		// own facing, before that is bent up for the lighting below - so only the top of a leaf card holds any, seen from
+		// either side.
+		[branch]
+		if ( g_flFloraSnowCover > 0.0f )
+		{
+			float steepest = lerp( 1.0f, FLORA_SNOW_STEEPEST, saturate( g_flFloraSnowCover ) );
+			float snow = smoothstep( steepest, steepest + FLORA_SNOW_SOFTNESS, normalWs.z ) * g_flSnowHold;
+
+			albedo = lerp( albedo, g_vFloraSnowColor, snow );
+		}
 
 		normalWs = normalize( lerp( normalWs, float3( 0, 0, 1 ), g_flNormalUpBias ) );
 
