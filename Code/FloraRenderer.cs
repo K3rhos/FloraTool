@@ -143,6 +143,28 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 		_hasStreamOrigin = false;
 	}
 
+	/// <summary>
+	/// Every scene object carries this object's tags, as a renderer's own do - so a camera can leave the flora out, or
+	/// draw nothing else, by tag. The pooled ones too, so none comes back out of the pool still wearing the old ones.
+	/// </summary>
+	protected override void OnTagsChanged()
+	{
+		foreach (var (_, chunk) in _live)
+		{
+			foreach (var sceneObject in chunk.SceneObjects)
+			{
+				if (sceneObject.IsValid())
+					sceneObject.Tags.SetFrom(Tags);
+			}
+		}
+
+		foreach (var sceneObject in _pool)
+		{
+			if (sceneObject.IsValid())
+				sceneObject.Tags.SetFrom(Tags);
+		}
+	}
+
 	protected override void OnUpdate()
 	{
 		var viewer = GetViewerPosition();
@@ -448,7 +470,11 @@ public sealed partial class FloraRenderer : Component, Component.ExecuteInEditor
 			return pooled;
 		}
 
-		return new SceneObject(world, model, transform);
+		// Tagged as this object is (OnTagsChanged); a pooled one already is.
+		var created = new SceneObject(world, model, transform);
+		created.Tags.SetFrom(Tags);
+
+		return created;
 	}
 
 	private void Return(SceneObject sceneObject)
